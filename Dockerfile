@@ -14,10 +14,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 WORKDIR /workspace
 
-# Copy API server from build dir
 COPY .hathora_build/app/serve_asr.py /workspace/serve_asr.py
 
 ENV MODEL_ID=nvidia/parakeet-tdt-0.6b-v3
+ENV PORT=8080
 
-# API server on port 8080
-ENTRYPOINT ["uvicorn", "serve_asr:app", "--host", "0.0.0.0", "--port", "8080"]
+EXPOSE 8080
+CMD ["sh", "-c", "echo Starting uvicorn on 0.0.0.0:${PORT} && uvicorn serve_asr:app --host 0.0.0.0 --port ${PORT} --log-level info"]
