@@ -16,7 +16,6 @@ WORKDIR /workspace
 
 COPY .hathora_build/app/serve_asr.py /workspace/serve_asr.py
 
-ENV MODEL_ID=nvidia/parakeet-tdt-0.6b-v3
 ENV PORT=8080
 
 EXPOSE 8080

@@ -66,7 +66,10 @@ app.add_middleware(
     ],
 )
 
-MODEL_ID = os.getenv("MODEL_ID", "nvidia/parakeet-tdt-0.6b-v3")
+MODEL_ID = os.getenv("MODEL_ID")
+if not MODEL_ID:
+    raise RuntimeError("MODEL_ID environment variable must be set to a valid NeMo ASR model.")
+EOU_TOKEN = "<EOU>"
 
 
 class ModelManager:
@@ -144,6 +147,14 @@ def extract_texts(transcribe_result) -> List[str]:
             return transcribe_result
     
     return [str(transcribe_result[0]) if transcribe_result else ""]
+
+
+def sanitize_transcript(text: str) -> str:
+    """Remove special tokens like <EOU> that are emitted by streaming models."""
+    if not text:
+        return text
+    cleaned = text.replace(EOU_TOKEN, "")
+    return cleaned.strip()
 
 
 @app.on_event("startup")
@@ -284,7 +295,7 @@ async def transcribe(
             channel_selector=cs,
         )
         texts = extract_texts(results)
-        transcript = texts[0] if texts else ""
+        transcript = sanitize_transcript(texts[0] if texts else "")
         logger.info(f"Transcription complete: {len(transcript)} characters")
         return {"text": transcript}
     except Exception as e:
