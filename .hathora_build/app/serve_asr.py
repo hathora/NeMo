@@ -132,11 +132,16 @@ class AudioBufferer:
         if not isinstance(audio, torch.Tensor):
             audio = torch.from_numpy(audio).to(self.device)
         audio_size = audio.shape[0]
+        
+        # If incoming audio is larger than buffer, only keep the last buffer_size samples
         if audio_size > self.buffer_size:
-            raise ValueError(f"Frame size ({audio_size}) exceeds buffer size ({self.buffer_size})")
-        shift = audio_size
-        self.sample_buffer[:-shift] = self.sample_buffer[shift:].clone()
-        self.sample_buffer[-shift:] = audio.clone()
+            audio = audio[-self.buffer_size:]
+            self.sample_buffer[:] = audio.clone()
+        else:
+            # Shift buffer and append new audio
+            shift = audio_size
+            self.sample_buffer[:-shift] = self.sample_buffer[shift:].clone()
+            self.sample_buffer[-shift:] = audio.clone()
     
     def get_buffer(self) -> torch.Tensor:
         return self.sample_buffer.clone()
