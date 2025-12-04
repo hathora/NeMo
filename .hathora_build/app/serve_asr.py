@@ -497,32 +497,38 @@ class ModelManager:
     def _load_model(self):
         """Load the ASR model with progress tracking."""
         import time
+        import sys
         
-        logger.info(f"Loading model: {MODEL_ID}")
-        logger.info("Fetching model from Hugging Face...")
+        # Use print with flush for immediate visibility in container logs
+        print(f"[MODEL] Starting to load: {MODEL_ID}", flush=True)
+        print(f"[MODEL] Fetching from Hugging Face (this may take a few minutes on first run)...", flush=True)
         
         start_time = time.time()
         
         try:
+            # Log progress every 30 seconds during download
             model = nemo_asr.models.ASRModel.from_pretrained(MODEL_ID)
             download_time = time.time() - start_time
-            logger.info(f"Model loaded from cache/download complete (took {download_time:.2f}s)")
+            print(f"[MODEL] Download/cache complete (took {download_time:.2f}s)", flush=True)
         except Exception as e:
+            print(f"[MODEL] ERROR: Failed to load model: {e}", flush=True)
             logger.error(f"Failed to load model: {e}", exc_info=True)
             raise
         
         if torch.cuda.is_available():
-            logger.info(f"CUDA available - GPU: {torch.cuda.get_device_name(0)}")
+            gpu_name = torch.cuda.get_device_name(0)
+            print(f"[MODEL] CUDA available - GPU: {gpu_name}", flush=True)
             gpu_start = time.time()
             model = model.cuda()
-            logger.info(f"Model moved to GPU (took {time.time() - gpu_start:.2f}s)")
+            print(f"[MODEL] Model moved to GPU (took {time.time() - gpu_start:.2f}s)", flush=True)
         else:
-            logger.warning("CUDA not available - using CPU (inference will be VERY slow)")
+            print("[MODEL] WARNING: CUDA not available - using CPU (will be VERY slow)", flush=True)
         
         model.eval()
         self._model = model
         total_time = time.time() - start_time
-        logger.info(f"Model ready for inference (total startup: {total_time:.2f}s)")
+        print(f"[MODEL] Ready for inference (total startup: {total_time:.2f}s)", flush=True)
+        sys.stdout.flush()
 
 
 model_manager = ModelManager()
@@ -564,12 +570,16 @@ def sanitize_transcript(text: str) -> str:
 
 @app.on_event("startup")
 def startup_event():
-    logger.info("=== NeMo ASR API Starting ===")
-    logger.info(f"Model ID: {MODEL_ID}")
-    logger.info(f"Port: {os.getenv('PORT', '8080')}")
-    logger.info("Pre-loading model on startup...")
+    print("=" * 60, flush=True)
+    print("=== NeMo ASR API Starting ===", flush=True)
+    print(f"Model ID: {MODEL_ID}", flush=True)
+    print(f"Port: {os.getenv('PORT', '8080')}", flush=True)
+    print("=" * 60, flush=True)
+    print("Pre-loading model on startup...", flush=True)
     model_manager.get_model()
-    logger.info("=== Startup complete - ready to accept requests ===")
+    print("=" * 60, flush=True)
+    print("=== Startup complete - ready to accept requests ===", flush=True)
+    print("=" * 60, flush=True)
 
 
 @app.get("/v1/health")
