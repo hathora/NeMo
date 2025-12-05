@@ -97,7 +97,7 @@ EOB_TOKEN = "<EOB>"
 
 # Streaming ASR configuration
 SAMPLE_RATE = 16000
-CHUNK_SIZE_IN_SECS = 0.08  # 80ms chunks for FastConformer
+CHUNK_SIZE_IN_SECS = 0.16  # 160ms chunks (model.encoder.streaming_cfg.chunk_size * window_stride)
 ATT_CONTEXT_SIZE = [70, 1]  # Left and right attention context
 LOG_MEL_ZERO = -16.635  # Log-Mel spectrogram value for zero signals
 
@@ -118,12 +118,18 @@ class ASRResult:
 
 
 class AudioBufferer:
-    """Simple audio buffer for accumulating samples."""
+    """Simple audio buffer for accumulating samples with dynamic resizing."""
+    
+    # Minimum buffer size to handle typical WebSocket audio chunks (2 seconds)
+    MIN_BUFFER_SECS = 2.0
     
     def __init__(self, sample_rate: int, buffer_size_in_secs: float, device: str = "cuda"):
-        self.buffer_size = int(buffer_size_in_secs * sample_rate)
+        # Use at least MIN_BUFFER_SECS to handle large incoming chunks
+        actual_buffer_secs = max(buffer_size_in_secs, self.MIN_BUFFER_SECS)
+        self.buffer_size = int(actual_buffer_secs * sample_rate)
         self.device = device
         self.sample_buffer = torch.zeros(self.buffer_size, dtype=torch.float32, device=device)
+        logger.info(f"AudioBufferer initialized: requested={buffer_size_in_secs}s, actual={actual_buffer_secs}s, samples={self.buffer_size}")
     
     def reset(self) -> None:
         self.sample_buffer.zero_()
@@ -133,15 +139,13 @@ class AudioBufferer:
             audio = torch.from_numpy(audio).to(self.device)
         audio_size = audio.shape[0]
         
-        # If incoming audio is larger than buffer, only keep the last buffer_size samples
-        if audio_size > self.buffer_size:
-            audio = audio[-self.buffer_size:]
-            self.sample_buffer[:] = audio.clone()
+        if audio_size >= self.buffer_size:
+            # If incoming audio fills or exceeds buffer, take the last buffer_size samples
+            self.sample_buffer[:] = audio[-self.buffer_size:].clone()
         else:
-            # Shift buffer and append new audio
-            shift = audio_size
-            self.sample_buffer[:-shift] = self.sample_buffer[shift:].clone()
-            self.sample_buffer[-shift:] = audio.clone()
+            # Normal sliding window: shift buffer left and append new audio
+            self.sample_buffer[:-audio_size] = self.sample_buffer[audio_size:].clone()
+            self.sample_buffer[-audio_size:] = audio.clone()
     
     def get_buffer(self) -> torch.Tensor:
         return self.sample_buffer.clone()
@@ -391,19 +395,15 @@ class StreamingASRManager:
             pass
         return None
     
-    def transcribe(self, audio: bytes) -> ASRResult:
-        """Process audio chunk and return transcription result."""
-        start_time = time.time()
-        
-        # Convert bytes to numpy array (16-bit PCM)
-        audio_array = np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
+    def _process_audio_chunk(self, audio_array: np.ndarray) -> None:
+        """Process a single audio chunk through the encoder."""
         self._audio_buffer.update(audio_array)
         
         features = self._audio_buffer.get_feature_buffer()
         feature_lengths = torch.tensor([features.shape[1]], device=self.device)
         features = features.unsqueeze(0)  # Add batch dimension
         
-        # Use AMP (Automatic Mixed Precision) for faster inference on supported GPUs
+        # Use AMP for faster inference
         with torch.no_grad(), torch.cuda.amp.autocast(enabled=self.device == "cuda"):
             (
                 encoded,
@@ -421,15 +421,60 @@ class StreamingASRManager:
                 drop_extra_pre_encoded=self.drop_extra_pre_encoded,
             )
             
-            best_hyp = self._get_best_hypothesis(encoded, encoded_len, partial_hypotheses=self._previous_hypotheses)
+            best_hyp = self._get_best_hypothesis(
+                encoded, encoded_len, partial_hypotheses=self._previous_hypotheses
+            )
             
             self._previous_hypotheses = best_hyp
             self._cache_last_channel = cache_last_channel
             self._cache_last_time = cache_last_time
             self._cache_last_channel_len = cache_last_channel_len
+    
+    def transcribe(self, audio: bytes) -> ASRResult:
+        """Process audio chunk and return transcription result.
         
-        tokens, probs = self._get_tokens_and_probs_from_alignments(best_hyp[0].alignments)
-        text = self.get_text_from_tokens(tokens)
+        Audio is buffered and processed in the expected chunk size for proper
+        cache-aware streaming behavior.
+        """
+        start_time = time.time()
+        
+        # Convert bytes to numpy array (16-bit PCM)
+        audio_array = np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
+        
+        # Initialize pending audio buffer if needed
+        if not hasattr(self, '_pending_audio'):
+            self._pending_audio = np.array([], dtype=np.float32)
+        if not hasattr(self, '_debug_count'):
+            self._debug_count = 0
+        self._debug_count += 1
+        
+        # Add new audio to pending buffer
+        self._pending_audio = np.concatenate([self._pending_audio, audio_array])
+        
+        # Expected chunk size for streaming (80ms at 16kHz = 1280 samples)
+        expected_chunk_samples = int(self.chunk_size_in_secs * SAMPLE_RATE)
+        
+        # Process all complete chunks from pending buffer
+        chunks_processed = 0
+        while len(self._pending_audio) >= expected_chunk_samples:
+            chunk = self._pending_audio[:expected_chunk_samples]
+            self._pending_audio = self._pending_audio[expected_chunk_samples:]
+            self._process_audio_chunk(chunk)
+            chunks_processed += 1
+        
+        # Get current transcription - use the hypothesis text directly
+        text = ""
+        tokens = []
+        probs = []
+        if self._previous_hypotheses and len(self._previous_hypotheses) > 0:
+            hyp = self._previous_hypotheses[0]
+            # Get text from y_sequence (token IDs)
+            if hasattr(hyp, 'y_sequence') and len(hyp.y_sequence) > 0:
+                tokens = [int(t) for t in hyp.y_sequence if int(t) != self.blank_id]
+                text = self.get_text_from_tokens(tokens)
+            # Get probs from alignments if available
+            if hasattr(hyp, 'alignments') and hyp.alignments:
+                _, probs = self._get_tokens_and_probs_from_alignments(hyp.alignments)
         
         is_final = False
         eou_latency = None
@@ -480,6 +525,9 @@ class StreamingASRManager:
         self._reset_cache()
         self._previous_hypotheses = self._get_blank_hypothesis()
         self._last_transcript_timestamp = time.time()
+        # Clear pending audio buffer
+        if hasattr(self, '_pending_audio'):
+            self._pending_audio = np.array([], dtype=np.float32)
 
 
 class ModelManager:
@@ -677,7 +725,20 @@ async def stream_transcribe(websocket: WebSocket):
         
         while True:
             # Receive message (can be binary audio or JSON control message)
-            message = await websocket.receive()
+            try:
+                message = await websocket.receive()
+            except RuntimeError as e:
+                # Client disconnected
+                if "disconnect" in str(e).lower():
+                    logger.info(f"[{session_id}] Client disconnected (receive error)")
+                    break
+                raise
+            
+            # Check for disconnect message type
+            msg_type = message.get("type", "")
+            if msg_type == "websocket.disconnect" or msg_type == "disconnect":
+                logger.info(f"[{session_id}] Client disconnected")
+                break
             
             if "bytes" in message:
                 # Binary audio data
